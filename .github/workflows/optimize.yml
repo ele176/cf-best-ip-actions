@@ -1,0 +1,47 @@
+name: Cloudflare 优选 IP
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只测试，不修改 DNS"
+        required: true
+        type: boolean
+        default: true
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-best-ip
+  cancel-in-progress: false
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Aggregate, verify and update DNS
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          DNS_RECORD: ${{ vars.DNS_RECORD }}
+          SNI_DOMAIN: ${{ vars.SNI_DOMAIN }}
+          ISP: ${{ vars.ISP || 'all' }}
+          VERIFY_PATH: ${{ vars.VERIFY_PATH || '/' }}
+          EXPECTED_STATUSES: ${{ vars.EXPECTED_STATUSES }}
+          MIN_SWITCH_AGE_HOURS: ${{ vars.MIN_SWITCH_AGE_HOURS || '24' }}
+          EXTRA_SOURCE_URLS: ${{ vars.EXTRA_SOURCE_URLS }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+          PYTHONUNBUFFERED: "1"
+        run: python scripts/optimizer.py

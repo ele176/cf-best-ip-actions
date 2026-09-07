@@ -1,0 +1,56 @@
+name: Weekly maintenance check
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "43 3 * * 1"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: cloudflare-best-ip-maintenance
+  cancel-in-progress: true
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run unit tests
+        id: tests
+        continue-on-error: true
+        run: python -m unittest discover -s tests -v
+
+      - name: Check upstream health
+        id: upstream
+        continue-on-error: true
+        run: python scripts/maintenance_check.py
+
+      - name: Open one maintenance issue on failure
+        if: steps.tests.outcome == 'failure' || steps.upstream.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TEST_RESULT: ${{ steps.tests.outcome }}
+          UPSTREAM_RESULT: ${{ steps.upstream.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          existing="$(gh issue list --repo "$REPOSITORY" --state open --search '"Automated maintenance alert" in:title' --json number --jq '.[0].number // empty')"
+          body="Weekly self-check failed. Unit tests: ${TEST_RESULT}; upstream health: ${UPSTREAM_RESULT}. Logs: ${RUN_URL}"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$REPOSITORY" --title "Automated maintenance alert" --body "$body"
+          fi
+
+      - name: Fail after reporting
+        if: steps.tests.outcome == 'failure' || steps.upstream.outcome == 'failure'
+        run: exit 1
