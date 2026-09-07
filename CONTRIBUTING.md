@@ -8,6 +8,6 @@
 4. 运行 `python -m unittest discover -s tests -v`。
 5. 提交 Pull Request，说明动机、行为变化和测试结果。
 
-请勿在 Issue、Pull Request、提交、截图或日志中加入 Cloudflare API Token、Zone ID、真实域名配置或其他凭据。外部候选源必须支持 HTTPS，且其结果仍须经过 Cloudflare 官方网段过滤和 SNI/TLS/HTTP 验证。
+请勿在 Issue、Pull Request、提交、截图或日志中加入 Cloudflare API Token、Zone ID、真实域名配置或其他凭据。外部候选源必须支持 HTTPS；所有候选必须经过目标 SNI 的证书与多轮 TLS/HTTP 验证，反代/BYOIP 地址不能仅凭来源声明放行。
 
-维护者可以拒绝削弱安全失败、最小权限、官方网段过滤或 Secret 隔离的改动。
+维护者可以拒绝削弱安全失败、最小权限、证书验证、多轮验证或 Secret 隔离的改动。

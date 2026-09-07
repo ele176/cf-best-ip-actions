@@ -24,6 +24,7 @@ from typing import Iterable
 CF_API = "https://api.cloudflare.com/client/v4"
 CF_IPV4_URL = "https://www.cloudflare.com/ips-v4"
 BESTCF_BASE = "https://raw.githubusercontent.com/DustinWin/BestCF/bestcf"
+BESTCF_DOMAIN_URL = f"{BESTCF_BASE}/bestcf-domain.txt"
 SOURCE_FILES = {
     "cmcc": "cmcc-ip.txt",
     "cucc": "cucc-ip.txt",
@@ -32,12 +33,26 @@ SOURCE_FILES = {
 }
 REDUNDANT_SOURCES = (
     (
+        "ipdb-official",
+        "https://ipdb.api.030101.xyz/?type=bestcf",
+        "global",
+    ),
+    (
+        "ipdb-proxy",
+        "https://ipdb.api.030101.xyz/?type=bestproxy",
+        "global",
+    ),
+    (
         "lancelot-global",
         "https://raw.githubusercontent.com/LancelotRar/best-cf-ips/main/best-cf-ipv4.txt",
         "global",
     ),
 )
 IPV4_RE = re.compile(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
+DOMAIN_RE = re.compile(
+    r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$",
+    re.IGNORECASE,
+)
 USER_AGENT = "cf-best-ip-actions/1.0"
 MAX_RESPONSE_BYTES = 1_048_576
 
@@ -51,6 +66,7 @@ class Candidate:
     latency_ms: float = float("inf")
     status: int | None = None
     successes: int = 0
+    recommendations: int = 0
 
     @property
     def average_position(self) -> float:
@@ -58,7 +74,7 @@ class Candidate:
 
     @property
     def votes(self) -> int:
-        return len(self.providers)
+        return len(self.providers - {"official-sample"})
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -130,7 +146,7 @@ def parse_provider(comment: str, fallback: str) -> tuple[str, int]:
 
 def parse_candidates(text: str, source: str, carrier: str) -> list[tuple[str, str, int, str]]:
     parsed: list[tuple[str, str, int, str]] = []
-    for raw_line in text.splitlines():
+    for line_number, raw_line in enumerate(text.splitlines(), 1):
         match = IPV4_RE.search(raw_line)
         if not match:
             continue
@@ -142,8 +158,82 @@ def parse_candidates(text: str, source: str, carrier: str) -> list[tuple[str, st
             continue
         comment = raw_line.split("#", 1)[1] if "#" in raw_line else ""
         provider, position = parse_provider(comment, source)
+        if position == 999:
+            position = line_number
         parsed.append((ip, provider, position, carrier))
     return parsed
+
+
+def parse_domains(text: str, limit: int = 40) -> list[str]:
+    domains: list[str] = []
+    for raw_line in text.splitlines():
+        domain = raw_line.strip().lower().rstrip(".")
+        if not domain or domain.startswith("#") or not DOMAIN_RE.fullmatch(domain):
+            continue
+        if domain not in domains:
+            domains.append(domain)
+        if len(domains) >= limit:
+            break
+    return domains
+
+
+def resolve_domain(domain: str) -> tuple[str, list[str]]:
+    addresses: set[str] = set()
+    try:
+        answers = socket.getaddrinfo(domain, 443, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        for answer in answers:
+            addresses.add(answer[4][0])
+    except OSError:
+        pass
+    return domain, sorted(addresses)
+
+
+def collect_domain_candidates(candidates: dict[str, Candidate], providers_seen: set[str]) -> int:
+    try:
+        domains = parse_domains(fetch_text(BESTCF_DOMAIN_URL))
+    except Exception as exc:
+        print(f"warning: unable to read bestcf domains: {exc}")
+        return 0
+
+    resolved = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, max(1, len(domains)))) as pool:
+        for domain, addresses in pool.map(resolve_domain, domains):
+            if not addresses:
+                continue
+            provider = f"dns:{domain}"
+            providers_seen.add(provider)
+            for position, ip in enumerate(addresses, 1):
+                candidate = candidates.setdefault(ip, Candidate(ip=ip))
+                candidate.providers.add(provider)
+                candidate.positions.append(position)
+                candidate.carriers.add("global")
+                candidate.recommendations += 1
+                resolved += 1
+    print(f"source bestcf-domains: {resolved} resolved IPv4 candidates from {len(domains)} domains")
+    return resolved
+
+
+def add_official_samples(
+    candidates: dict[str, Candidate],
+    networks: Iterable[ipaddress.IPv4Network],
+    per_network: int,
+) -> int:
+    """Add deterministic coverage samples; these are fallbacks, not China-speed votes."""
+    added = 0
+    per_network = max(0, min(32, per_network))
+    if not per_network:
+        return 0
+    for network in networks:
+        usable = max(0, network.num_addresses - 2)
+        for index in range(1, per_network + 1):
+            offset = 1 + (usable * index) // (per_network + 1)
+            ip = str(network.network_address + min(offset, network.num_addresses - 2))
+            candidate = candidates.setdefault(ip, Candidate(ip=ip))
+            candidate.providers.add("official-sample")
+            candidate.positions.append(500 + index)
+            candidate.carriers.add("global")
+            added += 1
+    return added
 
 
 def load_cloudflare_networks() -> list[ipaddress.IPv4Network]:
@@ -198,6 +288,7 @@ def collect_candidates(isp: str, extra_urls: list[str]) -> tuple[dict[str, Candi
                 candidate.providers.add(provider)
                 candidate.positions.append(position)
                 candidate.carriers.add(parsed_carrier)
+                candidate.recommendations += 1
                 providers_seen.add(provider)
             print(f"source {source_name}: {len(parsed)} candidates")
         except Exception as exc:  # A broken third-party source must not abort the run.
@@ -205,6 +296,7 @@ def collect_candidates(isp: str, extra_urls: list[str]) -> tuple[dict[str, Candi
 
     if successful_sources == 0:
         raise RuntimeError("all candidate sources failed")
+    collect_domain_candidates(candidates, providers_seen)
     return candidates, providers_seen
 
 
@@ -277,11 +369,29 @@ def candidate_sort_key(candidate: Candidate, isp: str) -> tuple:
     return (
         -candidate.votes,
         -int(carrier_match),
+        -len(candidate.carriers),
+        -candidate.recommendations,
         candidate.average_position,
         -candidate.successes,
         candidate.latency_ms,
         candidate.ip,
     )
+
+
+def select_probe_candidates(
+    candidates: Iterable[Candidate], isp: str, limit: int, sample_reserve: int = 80
+) -> list[Candidate]:
+    """Keep a fallback slice of official coverage samples even with very large feeds."""
+    ranked = sorted(candidates, key=lambda item: candidate_sort_key(item, isp))
+    sourced = [item for item in ranked if item.votes > 0]
+    sample_only = [item for item in ranked if item.votes == 0 and "official-sample" in item.providers]
+    reserve = min(sample_reserve, limit // 4, len(sample_only))
+    selected = sourced[: max(0, limit - reserve)]
+    selected.extend(sample_only[:reserve])
+    if len(selected) < limit:
+        selected_ids = {id(item) for item in selected}
+        selected.extend(item for item in ranked if id(item) not in selected_ids)
+    return selected[:limit]
 
 
 def verify_candidates(
@@ -292,6 +402,7 @@ def verify_candidates(
     expected_statuses: set[int] | None,
     attempts: int,
     timeout: float,
+    min_successes: int = 1,
 ) -> list[Candidate]:
     verified: list[Candidate] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, max(1, len(candidates)))) as pool:
@@ -309,7 +420,7 @@ def verify_candidates(
         ]
         for future in concurrent.futures.as_completed(futures):
             candidate = future.result()
-            if candidate.successes:
+            if candidate.successes >= min_successes:
                 verified.append(candidate)
     return verified
 
@@ -403,7 +514,10 @@ def main() -> int:
     path = os.getenv("VERIFY_PATH", "/").strip() or "/"
     expected_statuses = parse_expected_statuses(os.getenv("EXPECTED_STATUSES", ""))
     min_age_hours = float(os.getenv("MIN_SWITCH_AGE_HOURS", "24"))
-    attempts = max(1, min(4, int(os.getenv("PROBE_ATTEMPTS", "2"))))
+    attempts = max(2, min(5, int(os.getenv("PROBE_ATTEMPTS", "3"))))
+    min_successes = max(1, min(attempts, int(os.getenv("MIN_PROBE_SUCCESSES", "2"))))
+    probe_limit = max(40, min(500, int(os.getenv("PROBE_LIMIT", "400"))))
+    samples_per_range = max(0, min(32, int(os.getenv("OFFICIAL_SAMPLE_PER_RANGE", "8"))))
     timeout = max(2.0, min(15.0, float(os.getenv("PROBE_TIMEOUT", "6"))))
     dry_run = env_bool("DRY_RUN", False)
     extra_urls = normalize_extra_source_urls(os.getenv("EXTRA_SOURCE_URLS", ""))
@@ -432,15 +546,17 @@ def main() -> int:
         raise RuntimeError("fewer than two independent candidate providers were available; keeping current DNS")
 
     networks = load_cloudflare_networks()
-    filtered = {
-        ip: candidate for ip, candidate in candidates_by_ip.items() if is_cloudflare_ip(ip, networks)
-    }
-    rejected = len(candidates_by_ip) - len(filtered)
-    print(f"candidate pool: {len(candidates_by_ip)}; non-Cloudflare rejected: {rejected}")
-    if not filtered:
-        raise RuntimeError("no candidate remained after Cloudflare network validation")
+    sampled = add_official_samples(candidates_by_ip, networks, samples_per_range)
+    official_count = sum(is_cloudflare_ip(ip, networks) for ip in candidates_by_ip)
+    proxy_count = len(candidates_by_ip) - official_count
+    print(
+        f"candidate pool: {len(candidates_by_ip)}; official: {official_count}; "
+        f"TLS-gated proxy/BYOIP: {proxy_count}; official samples added: {sampled}"
+    )
+    if not candidates_by_ip:
+        raise RuntimeError("candidate pool was empty")
 
-    ranked_for_probe = sorted(filtered.values(), key=lambda item: candidate_sort_key(item, isp))[:80]
+    ranked_for_probe = select_probe_candidates(candidates_by_ip.values(), isp, probe_limit)
     verified = verify_candidates(
         ranked_for_probe,
         sni=sni,
@@ -448,6 +564,7 @@ def main() -> int:
         expected_statuses=expected_statuses,
         attempts=attempts,
         timeout=timeout,
+        min_successes=min_successes,
     )
     verified.sort(key=lambda item: candidate_sort_key(item, isp))
     if not verified:
@@ -455,28 +572,28 @@ def main() -> int:
 
     best = verified[0]
     print("top validated candidates:")
-    for candidate in verified[:5]:
+    for candidate in verified[:10]:
         print(
             f"  {candidate.ip} sources={candidate.votes} "
-            f"rank={candidate.average_position:.1f} tls_http={candidate.latency_ms:.0f}ms "
-            f"status={candidate.status}"
+            f"recommendations={candidate.recommendations} rank={candidate.average_position:.1f} "
+            f"tls_http={candidate.latency_ms:.0f}ms successes={candidate.successes}/{attempts} "
+            f"status={candidate.status} official={is_cloudflare_ip(candidate.ip, networks)}"
         )
 
     current_candidate: Candidate | None = None
     if current_ip:
-        if current_ip in filtered:
-            current_candidate = filtered[current_ip]
+        if current_ip in candidates_by_ip:
+            current_candidate = candidates_by_ip[current_ip]
         else:
             current_candidate = Candidate(ip=current_ip)
-        if is_cloudflare_ip(current_ip, networks):
-            probe_candidate(
-                current_candidate,
-                sni=sni,
-                path=path,
-                expected_statuses=expected_statuses,
-                attempts=attempts,
-                timeout=timeout,
-            )
+        probe_candidate(
+            current_candidate,
+            sni=sni,
+            path=path,
+            expected_statuses=expected_statuses,
+            attempts=attempts,
+            timeout=timeout,
+        )
 
     age_hours = parse_modified_age_hours(record)
     switch, reason = should_switch(
@@ -494,20 +611,41 @@ def main() -> int:
         if result.get("content") != best.ip or result.get("proxied"):
             raise RuntimeError("Cloudflare returned an unexpected DNS record after update")
 
-    append_summary(
-        [
+    summary_lines = [
             "## Cloudflare 优选 IP 结果",
             "",
             f"- 目标记录：`{dns_record}`",
             f"- 验证域名：`{sni}`",
             f"- 运营商配置：`{isp}`",
+            f"- 独立来源：**{len(providers_seen)}**",
+            f"- 总候选：**{len(candidates_by_ip)}**（官方网段 {official_count}，反代/BYOIP {proxy_count}）",
+            f"- 本轮探测：**{len(ranked_for_probe)}**；连续通过：**{len(verified)}**（至少 {min_successes}/{attempts} 轮）",
             f"- 当前 IP：`{current_ip or '不存在'}`",
-            f"- 最佳候选：`{best.ip}`（{best.votes} 个来源，HTTP {best.status}）",
+            f"- 最佳候选：`{best.ip}`（{best.votes} 个来源，{best.recommendations} 次推荐，HTTP {best.status}）",
             f"- 最终决定：**{action}** `{'%s' % selected_ip}`",
             f"- 原因：{reason}",
             f"- 模式：`{'dry-run' if dry_run else 'live'}`",
+            "",
+            "### 前 10 个连续验证通过的候选",
+            "",
+            "| # | IP | 类型 | 来源数 | 推荐次数 | 成功轮次 | GitHub RTT | HTTP |",
+            "|---:|---|---|---:|---:|---:|---:|---:|",
+        ]
+    for index, candidate in enumerate(verified[:10], 1):
+        ip_type = "官方" if is_cloudflare_ip(candidate.ip, networks) else "反代/BYOIP"
+        summary_lines.append(
+            f"| {index} | `{candidate.ip}` | {ip_type} | {candidate.votes} | "
+            f"{candidate.recommendations} | {candidate.successes}/{attempts} | "
+            f"{candidate.latency_ms:.0f} ms | {candidate.status} |"
+        )
+    summary_lines.extend(
+        [
+            "",
+            "> GitHub RTT 仅用于可用性和同级候选排序，不代表中国本地宽带延迟。",
+            "> 反代/BYOIP 候选不靠网段名称放行，必须通过目标 SNI 的系统证书校验和多轮 HTTP 探测。",
         ]
     )
+    append_summary(summary_lines)
     return 0
 
 

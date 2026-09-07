@@ -1,6 +1,6 @@
 # Cloudflare 优选 IP 自动更新器
 
-零成本、无需在本地运行的 GitHub Actions 方案。它按运营商汇总公开优选结果，验证候选 IP 属于 Cloudflare 官方网段，并用你自己的 SNI 域名完成 TLS/HTTPS 探测，最后更新 Cloudflare 的灰云 A 记录。
+零成本、无需在本地运行的 GitHub Actions 方案。它按运营商汇总公开优选结果、优选域名解析、官方地址采样和反代/BYOIP 候选，并用你自己的 SNI 域名完成多轮 TLS/HTTPS 探测，最后更新 Cloudflare 的灰云 A 记录。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/ele176/cf-best-ip-actions/actions/workflows/ci.yml/badge.svg)](https://github.com/ele176/cf-best-ip-actions/actions/workflows/ci.yml)
@@ -9,9 +9,9 @@
 
 ## 工作流程
 
-1. 每 6 小时从多个上游汇总移动、联通、电信优选 IPv4，并保留两个独立备用源。
-2. 从 Cloudflare 官方地址获取当前 IPv4 网段，过滤非 Cloudflare IP。
-3. 使用你的 Worker/代理入口域名作为 SNI，对候选 IP 做真实 TLS 和 HTTP 探测。
+1. 每 6 小时从 BestCF、IPDB、Lancelot 及优选域名 DNS 解析汇总移动、联通、电信候选。
+2. 从 Cloudflare 官方 IPv4 网段生成覆盖采样，同时保留公开来源中的反代/BYOIP 候选。
+3. 使用你的 Worker/代理入口域名作为 SNI，对最多 400 个候选做 3 轮真实 TLS 和 HTTP 探测，至少通过 2 轮才进入排名，并为官方覆盖样本保留探测名额。
 4. 当前 IP 失效时立即切换；当前 IP 可用时默认 24 小时内不重复切换。
 5. 通过最小权限 API Token 更新指定灰云 A 记录。
 6. 任一步骤失败都保留原 DNS，不会写入未经验证的 IP。
@@ -25,7 +25,7 @@
 | `best.example.com` | 仅 DNS（灰云） | 返回自动选择的 Cloudflare IP |
 | `edge.example.com` | 已代理（橙云） | 绑定 Worker/路由，并作为 SNI 和 Host |
 
-先手动创建一条 A 记录：
+可以先手动创建一条 A 记录，也可以让程序在第一次正式运行时自动创建：
 
 ```text
 类型：A
@@ -74,6 +74,10 @@ Zone ID 位于 Cloudflare 对应域名的概述页面右侧。
 | `EXPECTED_STATUSES` | 否 | `200,204,400,426` | 留空表示接受 200–499 |
 | `MIN_SWITCH_AGE_HOURS` | 否 | `24` | 当前 IP 可用时的最短保持时间 |
 | `EXTRA_SOURCE_URLS` | 否 | 每行一个 URL | 补充纯文本候选 IP 来源 |
+| `PROBE_LIMIT` | 否 | `400` | 每轮最多主动验证的候选数量，范围 40–500 |
+| `PROBE_ATTEMPTS` | 否 | `3` | 每个候选探测轮数，范围 2–5 |
+| `MIN_PROBE_SUCCESSES` | 否 | `2` | 进入排名所需的最少成功轮数 |
+| `OFFICIAL_SAMPLE_PER_RANGE` | 否 | `8` | 每个 Cloudflare 官方 IPv4 网段的覆盖采样数 |
 
 `ISP` 可选值：
 
@@ -91,7 +95,7 @@ Zone ID 位于 Cloudflare 对应域名的概述页面右侧。
 1. 打开仓库顶部的 **Actions**。
 2. 选择“Cloudflare 优选 IP”。
 3. 点击 **Run workflow**。
-4. 第一次建议把 `dry_run` 设为 `true`，确认日志中候选、SNI 和目标记录正确。
+4. 第一次建议把 `dry_run` 设为 `true`，确认汇总页中的来源数、总候选、连续通过数、前 10 名、SNI 和目标记录正确。
 5. 再以 `dry_run=false` 运行一次，DNS 才会真正更新。
 
 之后工作流会在 UTC 时间每隔 6 小时的第 17 分钟运行。GitHub 定时任务可能延迟，这是正常现象。
@@ -122,9 +126,10 @@ host: edge.example.com
 ## 选择与防抖逻辑
 
 - 公开来源只负责提供候选，不具备直接写 DNS 的能力。
-- 每个候选必须位于 Cloudflare 官方 IPv4 网段。
-- 每个候选必须能用你的 SNI 完成证书校验并返回 HTTP 响应。
+- 官方网段候选和公开来源的反代/BYOIP 候选分别标记展示，不再把可用的反代入口提前删除。
+- 每个候选都必须能用你的 SNI 通过系统 CA 证书校验，并在默认 3 轮探测中至少成功 2 轮；非官方网段候选没有例外通道。
 - 多来源共同推荐优先，其次比较上游排名，最后才比较 GitHub Runner 探测耗时。
+- Actions 汇总页展示总候选、官方网段/反代候选数量、实际探测数、连续通过数和前 10 名；DNS 仍只写入排名第一的 IP，避免轮询到较差地址。
 - 当前 IP 探测失败：立即换成最佳可用候选。
 - 当前 IP 正常且修改不足 24 小时：保持不动。
 - 当前 IP 正常且仍属于较优候选：没有明显优势时不切换。
@@ -162,7 +167,7 @@ DNS 解析器或客户端可能缓存旧结果。重启客户端或清理 DNS �
 
 ## 数据来源与边界
 
-默认候选读取自 `DustinWin/BestCF` 维护的三网聚合文件，其中包含 CMLiu、VPS789、CloudFlareYes、微测网等公开来源；同时使用 `LancelotRar/best-cf-ips` 作为独立备用。IP 所属网段始终以 Cloudflare 官方列表为准。上游结构变化时，工作流会安全失败并保留当前 DNS。
+默认候选读取自 `DustinWin/BestCF` 维护的三网 IP 与优选域名，其中包含 CMLiu、VPS789、CloudFlareYes、微测网等公开来源；同时接入 IPDB 的 `bestcf`/`bestproxy` 接口和 `LancelotRar/best-cf-ips`。Cloudflare 官方列表用于标记和生成覆盖样本；反代/BYOIP 候选只有在目标 SNI 证书与多轮 HTTP 验证通过后才可使用。上游结构变化时，工作流会安全失败并保留当前 DNS。
 
 ## 参与贡献与安全报告
 

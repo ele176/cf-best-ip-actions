@@ -19,21 +19,29 @@ SPEC.loader.exec_module(optimizer)
 def main() -> int:
     networks = optimizer.load_cloudflare_networks()
     candidates, providers = optimizer.collect_candidates("all", [])
+    samples = optimizer.add_official_samples(candidates, networks, 8)
     valid = [ip for ip in candidates if optimizer.is_cloudflare_ip(ip, networks)]
+    proxy = [ip for ip in candidates if not optimizer.is_cloudflare_ip(ip, networks)]
 
     problems: list[str] = []
     if len(networks) < 10:
         problems.append(f"Cloudflare IPv4 network list unexpectedly small: {len(networks)}")
-    if len(providers) < 2:
-        problems.append(f"fewer than two candidate providers available: {sorted(providers)}")
-    if len(candidates) < 10:
+    if len(providers) < 4:
+        problems.append(f"fewer than four candidate providers available: {sorted(providers)}")
+    if len(candidates) < 100:
         problems.append(f"candidate pool unexpectedly small: {len(candidates)}")
     if len(valid) < 10:
         problems.append(f"fewer than ten candidates belong to official Cloudflare ranges: {len(valid)}")
 
     print(f"Cloudflare ranges: {len(networks)}")
     print(f"Providers: {', '.join(sorted(providers))}")
-    print(f"Candidates: {len(candidates)}; official-range candidates: {len(valid)}")
+    if not proxy:
+        problems.append("proxy/BYOIP candidate pool was empty")
+
+    print(
+        f"Candidates: {len(candidates)}; official-range candidates: {len(valid)}; "
+        f"proxy/BYOIP candidates: {len(proxy)}; deterministic samples: {samples}"
+    )
 
     if problems:
         for problem in problems:
@@ -45,4 +53,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

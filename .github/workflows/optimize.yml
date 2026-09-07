@@ -42,6 +42,10 @@ jobs:
           EXPECTED_STATUSES: ${{ vars.EXPECTED_STATUSES }}
           MIN_SWITCH_AGE_HOURS: ${{ vars.MIN_SWITCH_AGE_HOURS || '24' }}
           EXTRA_SOURCE_URLS: ${{ vars.EXTRA_SOURCE_URLS }}
+          PROBE_LIMIT: ${{ vars.PROBE_LIMIT || '400' }}
+          PROBE_ATTEMPTS: ${{ vars.PROBE_ATTEMPTS || '3' }}
+          MIN_PROBE_SUCCESSES: ${{ vars.MIN_PROBE_SUCCESSES || '2' }}
+          OFFICIAL_SAMPLE_PER_RANGE: ${{ vars.OFFICIAL_SAMPLE_PER_RANGE || '8' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
           PYTHONUNBUFFERED: "1"
         run: python scripts/optimizer.py

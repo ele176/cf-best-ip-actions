@@ -14,5 +14,5 @@
 
 - 项目只需要限定到单个 Zone 的 `Zone / DNS / Edit` API Token。
 - DNS 更新工作流不在外部 Pull Request 上运行。
-- 候选 IP 必须通过 Cloudflare 官方 IPv4 网段和目标 SNI 的 TLS/HTTP 验证。
+- Cloudflare 官方网段候选必须通过目标 SNI 的 TLS/HTTP 验证；反代/BYOIP 候选还必须通过系统 CA 证书校验和多轮成功阈值，不因来源声称而放行。
 - 上游、验证或 API 异常时保留现有 DNS 记录。

@@ -3,6 +3,7 @@ import ipaddress
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).parents[1] / "scripts" / "optimizer.py"
@@ -57,6 +58,60 @@ class OptimizerTests(unittest.TestCase):
         for unsafe in ("http://example.com/ips.txt", "https://user:pass@example.com/ips.txt"):
             with self.subTest(unsafe=unsafe), self.assertRaises(RuntimeError):
                 optimizer.normalize_extra_source_urls(unsafe)
+
+    def test_plain_source_uses_line_number_as_rank(self):
+        parsed = optimizer.parse_candidates("# title\n104.16.0.1\n104.16.0.2\n", "plain", "global")
+        self.assertEqual(parsed[0], ("104.16.0.1", "plain", 2, "global"))
+        self.assertEqual(parsed[1], ("104.16.0.2", "plain", 3, "global"))
+
+    def test_parse_domains_rejects_non_domains_and_deduplicates(self):
+        parsed = optimizer.parse_domains(
+            "Best.Example.com\nbest.example.com\nhttps://bad.example.com/path\ninvalid\ncf.example.org\n"
+        )
+        self.assertEqual(parsed, ["best.example.com", "cf.example.org"])
+
+    def test_official_sampling_covers_each_range(self):
+        candidates = {}
+        networks = [ipaddress.ip_network("104.16.0.0/24"), ipaddress.ip_network("172.64.0.0/24")]
+        added = optimizer.add_official_samples(candidates, networks, 4)
+        self.assertEqual(added, 8)
+        self.assertEqual(len(candidates), 8)
+        self.assertTrue(all("official-sample" in item.providers for item in candidates.values()))
+        self.assertTrue(all(item.votes == 0 for item in candidates.values()))
+
+    def test_probe_selection_reserves_official_coverage(self):
+        sourced = [
+            optimizer.Candidate(f"104.16.0.{index}", {"feed"}, {"global"}, [index])
+            for index in range(1, 31)
+        ]
+        samples = [
+            optimizer.Candidate(f"172.64.0.{index}", {"official-sample"}, {"global"}, [500])
+            for index in range(1, 21)
+        ]
+        selected = optimizer.select_probe_candidates(sourced + samples, "all", 40, sample_reserve=8)
+        self.assertEqual(len(selected), 40)
+        self.assertGreaterEqual(sum(item.votes == 0 for item in selected), 8)
+
+    def test_verify_requires_multiple_successes(self):
+        candidates = [optimizer.Candidate("104.16.0.1"), optimizer.Candidate("104.16.0.2")]
+
+        def fake_probe(candidate, **_kwargs):
+            candidate.successes = 2 if candidate.ip.endswith(".2") else 1
+            candidate.latency_ms = 10
+            candidate.status = 200
+            return candidate
+
+        with mock.patch.object(optimizer, "probe_candidate", side_effect=fake_probe):
+            verified = optimizer.verify_candidates(
+                candidates,
+                sni="example.com",
+                path="/",
+                expected_statuses=None,
+                attempts=3,
+                timeout=2,
+                min_successes=2,
+            )
+        self.assertEqual([item.ip for item in verified], ["104.16.0.2"])
 
 
 if __name__ == "__main__":
